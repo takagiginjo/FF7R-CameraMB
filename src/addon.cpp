@@ -450,6 +450,15 @@ static void hook_thread()
     if (!dx11 && !dx12) { LOG("unsupported graphics API %d", (int)g_api); return; }
     const char *exportName = dx11 ? "NVSDK_NGX_D3D11_EvaluateFeature" : "NVSDK_NGX_D3D12_EvaluateFeature";
 
+    // Hooks outlive this DLL if ReShade unloads and reloads it (seen in logs): never hook twice in one process.
+    // The mutex is intentionally never closed, so it lives as long as the process.
+    CreateMutexW(nullptr, FALSE, L"Local\\ff7_camera_motion_blur_hooked");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        LOG("hooks already installed by an earlier load of this add-on, skipping (add-on disabled in this instance)");
+        g_cfg.enabled = 0;
+        return;
+    }
+
     MH_Initialize();
     static const wchar_t *mods[] = { L"_nvngx.dll", L"nvngx.dll", L"nvngx_dlss.dll" };
     for (int i = 0; i < 1200 && !g_hooked11 && !g_hooked12; i++) {   // ~10 minutes
@@ -528,6 +537,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
+    {
+        // Pin: our detours live in this DLL, so it must never be unloaded (FreeLibrary becomes a no-op)
+        HMODULE pinned = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           reinterpret_cast<LPCWSTR>(&DllMain), &pinned);
+
         if (!reshade::register_addon(hModule)) return FALSE;
 
         reshade::get_config_value(nullptr, "CameraMotionBlur", "Enabled",  g_cfg.enabled);
@@ -547,6 +562,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 
         std::thread(hook_thread).detach();
         break;
+    }
     case DLL_PROCESS_DETACH:
         reshade::unregister_addon(hModule);
         break;
