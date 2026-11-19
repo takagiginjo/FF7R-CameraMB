@@ -13,6 +13,7 @@ FetchContent_Declare(reshade
     GIT_REPOSITORY https://github.com/crosire/reshade.git
     GIT_TAG        v6.4.1            # bump if the tag does not exist / to match your ReShade
     GIT_SHALLOW    TRUE
+    GIT_SUBMODULES ""
     SOURCE_SUBDIR  _no_cmake)
 
 # NVIDIA NGX headers only (we never link NGX, we read its parameter block)
@@ -20,6 +21,7 @@ FetchContent_Declare(dlss
     GIT_REPOSITORY https://github.com/NVIDIA/DLSS.git
     GIT_TAG        main
     GIT_SHALLOW    TRUE
+    GIT_SUBMODULES ""
     SOURCE_SUBDIR  _no_cmake)
 
 FetchContent_Declare(minhook
