@@ -11,9 +11,11 @@
 //   [CameraMotionBlur]
 //   Enabled=1  Strength=0.5  MaxBlur=0.04  Samples=16  ReverseZ=1
 
+#include <d3d11.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <windows.h>
+#include <psapi.h>
 
 #include <atomic>
 #include <cstdio>
@@ -152,7 +154,7 @@ struct Settings {
 
 struct Pending {
     bool valid = false;
-    ID3D12Resource *out = nullptr, *mv = nullptr, *depth = nullptr;
+    void *out = nullptr, *mv = nullptr, *depth = nullptr;
     float mvScaleX = 1.f, mvScaleY = 1.f;
 };
 static thread_local Pending g_pending;
@@ -313,6 +315,18 @@ static void run_pending(command_list *cl)
 
         cl->dispatch((od.texture.width + 7) / 8, (od.texture.height + 7) / 8, 1);
 
+        if (dev->get_api() == device_api::d3d11) {
+            // D3D11 state is sticky: unbind our views so the game's next pass sees no hazards
+            resource_view nulls[3] = {};
+            u.count = 3;
+            u.type = descriptor_type::texture_shader_resource_view;
+            u.descriptors = nulls;
+            cl->push_descriptors(shader_stage::compute, g_layout, 1, u);
+            u.count = 1;
+            u.type = descriptor_type::texture_unordered_access_view;
+            cl->push_descriptors(shader_stage::compute, g_layout, 2, u);
+        }
+
         cl->barrier(g_tmp, resource_usage::shader_resource, resource_usage::copy_dest);
     } while (false);
 
@@ -320,31 +334,47 @@ static void run_pending(command_list *cl)
 }
 
 // ---------------------------------------------------------------------------------------------
-// NGX hook
+// NGX hook (D3D11 for Remake + Luma, D3D12 for Rebirth)
 // ---------------------------------------------------------------------------------------------
-using EvalFn = NVSDK_NGX_Result(__cdecl *)(ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *,
-                                           const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback);
-static EvalFn g_orig = nullptr;
-static std::atomic<bool> g_hooked{ false };
+using EvalFn11 = NVSDK_NGX_Result(__cdecl *)(ID3D11DeviceContext *, const NVSDK_NGX_Handle *,
+                                             const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback);
+using EvalFn12 = NVSDK_NGX_Result(__cdecl *)(ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *,
+                                             const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback);
+static EvalFn11 g_orig11 = nullptr;
+static EvalFn12 g_orig12 = nullptr;
+static std::atomic<bool> g_hooked11{ false }, g_hooked12{ false };
 
-static NVSDK_NGX_Result __cdecl EvalDetour(ID3D12GraphicsCommandList *cl, const NVSDK_NGX_Handle *h,
-                                           const NVSDK_NGX_Parameter *cp, PFN_NVSDK_NGX_ProgressCallback cb)
+template <class Res>
+static void capture(NVSDK_NGX_Parameter *p)
 {
-    const NVSDK_NGX_Result r = g_orig(cl, h, cp, cb);
-    if (r != NVSDK_NGX_Result_Success || !cp || !g_cfg.enabled) return r;
-
-    NVSDK_NGX_Parameter *p = const_cast<NVSDK_NGX_Parameter *>(cp);
-    Pending n = {};
-    ID3D12Resource *out = nullptr, *mv = nullptr, *depth = nullptr;
-    if (NVSDK_NGX_FAILED(p->Get(NVSDK_NGX_Parameter_Output, &out)) || !out) return r;
-    if (NVSDK_NGX_FAILED(p->Get(NVSDK_NGX_Parameter_MotionVectors, &mv)) || !mv) return r;
-    if (NVSDK_NGX_FAILED(p->Get(NVSDK_NGX_Parameter_Depth, &depth)) || !depth) return r;
+    Res *out = nullptr, *mv = nullptr, *depth = nullptr;
+    if (NVSDK_NGX_FAILED(p->Get(NVSDK_NGX_Parameter_Output, &out)) || !out) return;
+    if (NVSDK_NGX_FAILED(p->Get(NVSDK_NGX_Parameter_MotionVectors, &mv)) || !mv) return;
+    if (NVSDK_NGX_FAILED(p->Get(NVSDK_NGX_Parameter_Depth, &depth)) || !depth) return;
     float sx = 1.f, sy = 1.f;
     p->Get(NVSDK_NGX_Parameter_MV_Scale_X, &sx);
     p->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &sy);
 
+    Pending n = {};
     n.valid = true; n.out = out; n.mv = mv; n.depth = depth; n.mvScaleX = sx; n.mvScaleY = sy;
     g_pending = n;   // consumed by the next ReShade event on this thread
+}
+
+static NVSDK_NGX_Result __cdecl EvalDetour11(ID3D11DeviceContext *cl, const NVSDK_NGX_Handle *h,
+                                             const NVSDK_NGX_Parameter *cp, PFN_NVSDK_NGX_ProgressCallback cb)
+{
+    const NVSDK_NGX_Result r = g_orig11(cl, h, cp, cb);
+    if (r == NVSDK_NGX_Result_Success && cp && g_cfg.enabled)
+        capture<ID3D11Resource>(const_cast<NVSDK_NGX_Parameter *>(cp));
+    return r;
+}
+
+static NVSDK_NGX_Result __cdecl EvalDetour12(ID3D12GraphicsCommandList *cl, const NVSDK_NGX_Handle *h,
+                                             const NVSDK_NGX_Parameter *cp, PFN_NVSDK_NGX_ProgressCallback cb)
+{
+    const NVSDK_NGX_Result r = g_orig12(cl, h, cp, cb);
+    if (r == NVSDK_NGX_Result_Success && cp && g_cfg.enabled)
+        capture<ID3D12Resource>(const_cast<NVSDK_NGX_Parameter *>(cp));
     return r;
 }
 
@@ -352,21 +382,39 @@ static void hook_thread()
 {
     MH_Initialize();
     static const wchar_t *mods[] = { L"_nvngx.dll", L"nvngx.dll", L"nvngx_dlss.dll" };
-    for (int i = 0; i < 1200 && !g_hooked; i++) {   // ~10 minutes
+    for (int i = 0; i < 1200 && !(g_hooked11 || g_hooked12); i++) {   // ~10 minutes
         for (const wchar_t *m : mods) {
             HMODULE mod = GetModuleHandleW(m);
             if (!mod) continue;
-            void *fn = (void *)GetProcAddress(mod, "NVSDK_NGX_D3D12_EvaluateFeature");
-            if (!fn) { continue; }
-            if (MH_CreateHook(fn, (void *)&EvalDetour, (void **)&g_orig) == MH_OK && MH_EnableHook(fn) == MH_OK) {
-                g_hooked = true;
-                LOG("hooked NVSDK_NGX_D3D12_EvaluateFeature in module %ls", m);
-                break;
+            if (!g_hooked11) {
+                void *fn = (void *)GetProcAddress(mod, "NVSDK_NGX_D3D11_EvaluateFeature");
+                if (fn && MH_CreateHook(fn, (void *)&EvalDetour11, (void **)&g_orig11) == MH_OK && MH_EnableHook(fn) == MH_OK) {
+                    g_hooked11 = true;
+                    LOG("hooked NVSDK_NGX_D3D11_EvaluateFeature in %ls", m);
+                }
+            }
+            if (!g_hooked12) {
+                void *fn = (void *)GetProcAddress(mod, "NVSDK_NGX_D3D12_EvaluateFeature");
+                if (fn && MH_CreateHook(fn, (void *)&EvalDetour12, (void **)&g_orig12) == MH_OK && MH_EnableHook(fn) == MH_OK) {
+                    g_hooked12 = true;
+                    LOG("hooked NVSDK_NGX_D3D12_EvaluateFeature in %ls", m);
+                }
             }
         }
-        if (!g_hooked) Sleep(500);
+        if (!(g_hooked11 || g_hooked12)) Sleep(500);
     }
-    if (!g_hooked) LOG("NGX export not found. Hook point needs adapting (see README).");
+    if (!(g_hooked11 || g_hooked12)) {
+        LOG("NGX evaluate export not found in any module. Loaded NGX-related modules:");
+        HMODULE mods2[1024]; DWORD need = 0;
+        if (EnumProcessModules(GetCurrentProcess(), mods2, sizeof(mods2), &need)) {
+            for (DWORD k = 0; k < need / sizeof(HMODULE); k++) {
+                char name[MAX_PATH] = {};
+                GetModuleFileNameA(mods2[k], name, MAX_PATH);
+                if (strstr(name, "ngx") || strstr(name, "dlss") || strstr(name, "Luma") || strstr(name, "luma"))
+                    LOG("  %s", name);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
