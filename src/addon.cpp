@@ -21,6 +21,8 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <reshade.hpp>
 
@@ -165,6 +167,7 @@ static uint32_t        g_tmp_w = 0, g_tmp_h = 0;
 static format          g_tmp_fmt = format::unknown;
 static uint32_t        g_frame = 0;
 static bool            g_pipe_failed = false;
+static std::vector<std::pair<resource, uint32_t>> g_deferred;   // old tmp textures, destroyed a few frames later
 
 static format srv_format(format f)
 {
@@ -239,8 +242,8 @@ static bool ensure_tmp(device *dev, uint32_t w, uint32_t h, format f)
 {
     if (g_tmp.handle && g_tmp_w == w && g_tmp_h == h && g_tmp_fmt == f) return true;
     if (g_tmp.handle) {
-        dev->wait_idle();
-        dev->destroy_resource(g_tmp);
+        // the GPU may still be using it: destroy a few frames later (see on_present)
+        g_deferred.emplace_back(g_tmp, g_frame);
         g_tmp = {};
     }
     const resource_desc d(w, h, 1, 1, f, 1, memory_heap::gpu_only,
@@ -373,7 +376,19 @@ static void hook_thread()
 static void on_barrier(command_list *cl, uint32_t, const resource *, const resource_usage *, const resource_usage *) { run_pending(cl); }
 static void on_bind_pipeline(command_list *cl, pipeline_stage, pipeline) { run_pending(cl); }
 static void on_bind_rt(command_list *cl, uint32_t, const resource_view *, resource_view) { run_pending(cl); }
-static void on_present(command_queue *, swapchain *, const rect *, const rect *, uint32_t, const rect *) { g_frame++; }
+static void on_present(command_queue *, swapchain *sc, const rect *, const rect *, uint32_t, const rect *)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_frame++;
+    for (size_t i = 0; i < g_deferred.size();) {
+        if (g_frame - g_deferred[i].second >= 8) {
+            sc->get_device()->destroy_resource(g_deferred[i].first);
+            g_deferred.erase(g_deferred.begin() + i);
+        } else {
+            i++;
+        }
+    }
+}
 
 static void on_destroy_resource(device *dev, resource res)
 {
@@ -391,6 +406,8 @@ static void on_destroy_device(device *dev)
         for (auto &kv : *map) dev->destroy_resource_view(kv.second);
         map->clear();
     }
+    for (auto &d : g_deferred) dev->destroy_resource(d.first);
+    g_deferred.clear();
     if (g_tmp.handle)    { dev->destroy_resource(g_tmp); g_tmp = {}; }
     if (g_pipe.handle)   { dev->destroy_pipeline(g_pipe); g_pipe = {}; }
     if (g_layout.handle) { dev->destroy_pipeline_layout(g_layout); g_layout = {}; }
