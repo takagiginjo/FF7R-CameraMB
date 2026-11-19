@@ -150,7 +150,11 @@ struct Settings {
     float maxBlur   = 0.04f;
     int   samples   = 16;
     int   reverseZ  = 1;
+    int   hookOnly  = 0;   // 1 = only hook + log, never draw (for bisecting crashes)
 } g_cfg;
+
+static std::atomic<int> g_dbg{ 0 };
+#define DBG(...) do { if (g_dbg.fetch_add(1) < 60) LOG(__VA_ARGS__); } while (0)
 
 struct Pending {
     bool valid = false;
@@ -263,12 +267,16 @@ static void run_pending(command_list *cl)
     if (!g_pending.valid || g_busy) return;
     const Pending p = g_pending;
     g_pending.valid = false;
+    if (g_cfg.hookOnly) { DBG("hook-only: pass skipped"); return; }
     g_busy = true;
+    DBG("run_pending: begin");
 
     do {
         std::lock_guard<std::mutex> lock(g_mutex);
         device *dev = cl->get_device();
+        DBG("run_pending: api=%d", (int)dev->get_api());
         if (!ensure_pipeline(dev)) break;
+        DBG("run_pending: pipeline ok");
 
         const resource out   = { reinterpret_cast<uintptr_t>(p.out) };
         const resource mv    = { reinterpret_cast<uintptr_t>(p.mv) };
@@ -277,10 +285,13 @@ static void run_pending(command_list *cl)
         const resource_desc od = dev->get_resource_desc(out);
         const resource_desc md = dev->get_resource_desc(mv);
         const format tf = format_to_default_typed(od.texture.format);
+        DBG("run_pending: out %ux%u fmt=%d, mv %ux%u fmt=%d", od.texture.width, od.texture.height, (int)od.texture.format,
+            md.texture.width, md.texture.height, (int)md.texture.format);
         if (!ensure_tmp(dev, od.texture.width, od.texture.height, tf)) break;
 
         resource_view views[3] = { get_view(dev, g_tmp, false), get_view(dev, mv, false), get_view(dev, depth, false) };
         resource_view uav = get_view(dev, out, true);
+        DBG("run_pending: views %d %d %d uav %d", views[0].handle != 0, views[1].handle != 0, views[2].handle != 0, uav.handle != 0);
         if (!views[0].handle || !views[1].handle || !views[2].handle || !uav.handle) break;
 
         // out (UAV) -> tmp copy
@@ -313,7 +324,9 @@ static void run_pending(command_list *cl)
         u.descriptors = &uav;
         cl->push_descriptors(shader_stage::compute, g_layout, 2, u);
 
+        DBG("run_pending: dispatch");
         cl->dispatch((od.texture.width + 7) / 8, (od.texture.height + 7) / 8, 1);
+        DBG("run_pending: dispatched");
 
         if (dev->get_api() == device_api::d3d11) {
             // D3D11 state is sticky: unbind our views so the game's next pass sees no hazards
@@ -345,7 +358,7 @@ static EvalFn12 g_orig12 = nullptr;
 static std::atomic<bool> g_hooked11{ false }, g_hooked12{ false };
 
 template <class Res>
-static void capture(NVSDK_NGX_Parameter *p)
+static void capture_impl(NVSDK_NGX_Parameter *p)
 {
     Res *out = nullptr, *mv = nullptr, *depth = nullptr;
     if (NVSDK_NGX_FAILED(p->Get(NVSDK_NGX_Parameter_Output, &out)) || !out) return;
@@ -355,15 +368,46 @@ static void capture(NVSDK_NGX_Parameter *p)
     p->Get(NVSDK_NGX_Parameter_MV_Scale_X, &sx);
     p->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &sy);
 
+    DBG("capture: out=%p mv=%p depth=%p mvscale=%f,%f", (void *)out, (void *)mv, (void *)depth, sx, sy);
     Pending n = {};
     n.valid = true; n.out = out; n.mv = mv; n.depth = depth; n.mvScaleX = sx; n.mvScaleY = sy;
     g_pending = n;   // consumed by the next ReShade event on this thread
 }
 
+template <class Res>
+static void capture(NVSDK_NGX_Parameter *p)
+{
+    __try {
+        capture_impl<Res>(p);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LOG("exception while reading NGX parameters (code 0x%08lx): add-on disabled", GetExceptionCode());
+        g_cfg.enabled = 0;
+    }
+}
+
+static void *g_target11 = nullptr, *g_target12 = nullptr;
+static thread_local int g_depth = 0;
+static std::atomic<int> g_api{ -1 };   // reshade::api::device_api of the running game
+
+static void break_recursion()
+{
+    // g_orig leads back into our detour (seen in a crash dump): unhook everything and fall back to the real function
+    LOG("re-entrancy detected (orig11=%p orig12=%p target11=%p target12=%p): hooks removed", (void *)g_orig11,
+        (void *)g_orig12, g_target11, g_target12);
+    MH_DisableHook(MH_ALL_HOOKS);
+    g_cfg.enabled = 0;
+}
+
 static NVSDK_NGX_Result __cdecl EvalDetour11(ID3D11DeviceContext *cl, const NVSDK_NGX_Handle *h,
                                              const NVSDK_NGX_Parameter *cp, PFN_NVSDK_NGX_ProgressCallback cb)
 {
+    if (g_depth >= 4) {
+        break_recursion();
+        return ((EvalFn11)g_target11)(cl, h, cp, cb);   // now unhooked: calls the real function
+    }
+    ++g_depth;
     const NVSDK_NGX_Result r = g_orig11(cl, h, cp, cb);
+    --g_depth;
     if (r == NVSDK_NGX_Result_Success && cp && g_cfg.enabled)
         capture<ID3D11Resource>(const_cast<NVSDK_NGX_Parameter *>(cp));
     return r;
@@ -372,49 +416,66 @@ static NVSDK_NGX_Result __cdecl EvalDetour11(ID3D11DeviceContext *cl, const NVSD
 static NVSDK_NGX_Result __cdecl EvalDetour12(ID3D12GraphicsCommandList *cl, const NVSDK_NGX_Handle *h,
                                              const NVSDK_NGX_Parameter *cp, PFN_NVSDK_NGX_ProgressCallback cb)
 {
+    if (g_depth >= 4) {
+        break_recursion();
+        return ((EvalFn12)g_target12)(cl, h, cp, cb);
+    }
+    ++g_depth;
     const NVSDK_NGX_Result r = g_orig12(cl, h, cp, cb);
+    --g_depth;
     if (r == NVSDK_NGX_Result_Success && cp && g_cfg.enabled)
         capture<ID3D12Resource>(const_cast<NVSDK_NGX_Parameter *>(cp));
     return r;
 }
 
+static void log_bytes(const char *what, void *p)
+{
+    char hex[64] = {};
+    __try {
+        for (int i = 0; i < 16; i++) sprintf_s(hex + i * 3, sizeof(hex) - i * 3, "%02x ", ((unsigned char *)p)[i]);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { strcpy_s(hex, "?"); }
+    LOG("%s at %p: %s", what, p, hex);
+}
+
 static void hook_thread()
 {
+    // Wait for the game's graphics API, then hook ONLY the matching NGX export
+    for (int i = 0; i < 600 && g_api < 0; i++) Sleep(100);   // init_device event normally fires first
+    if (g_api < 0) {   // fallback if the device was created before this add-on loaded
+        g_api = GetModuleHandleW(L"d3d11.dll") ? (int)device_api::d3d11 : (int)device_api::d3d12;
+        LOG("init_device not seen, guessing API %d from loaded modules", (int)g_api);
+    }
+    const bool dx11 = g_api == (int)device_api::d3d11;
+    const bool dx12 = g_api == (int)device_api::d3d12;
+    if (!dx11 && !dx12) { LOG("unsupported graphics API %d", (int)g_api); return; }
+    const char *exportName = dx11 ? "NVSDK_NGX_D3D11_EvaluateFeature" : "NVSDK_NGX_D3D12_EvaluateFeature";
+
     MH_Initialize();
     static const wchar_t *mods[] = { L"_nvngx.dll", L"nvngx.dll", L"nvngx_dlss.dll" };
-    for (int i = 0; i < 1200 && !(g_hooked11 || g_hooked12); i++) {   // ~10 minutes
+    for (int i = 0; i < 1200 && !g_hooked11 && !g_hooked12; i++) {   // ~10 minutes
         for (const wchar_t *m : mods) {
             HMODULE mod = GetModuleHandleW(m);
             if (!mod) continue;
-            if (!g_hooked11) {
-                void *fn = (void *)GetProcAddress(mod, "NVSDK_NGX_D3D11_EvaluateFeature");
-                if (fn && MH_CreateHook(fn, (void *)&EvalDetour11, (void **)&g_orig11) == MH_OK && MH_EnableHook(fn) == MH_OK) {
-                    g_hooked11 = true;
-                    LOG("hooked NVSDK_NGX_D3D11_EvaluateFeature in %ls", m);
-                }
-            }
-            if (!g_hooked12) {
-                void *fn = (void *)GetProcAddress(mod, "NVSDK_NGX_D3D12_EvaluateFeature");
-                if (fn && MH_CreateHook(fn, (void *)&EvalDetour12, (void **)&g_orig12) == MH_OK && MH_EnableHook(fn) == MH_OK) {
-                    g_hooked12 = true;
-                    LOG("hooked NVSDK_NGX_D3D12_EvaluateFeature in %ls", m);
-                }
-            }
+            void *fn = (void *)GetProcAddress(mod, exportName);
+            if (!fn) continue;
+            LOG("%ls: %s resolves to %p (module base %p)", m, exportName, fn, (void *)mod);
+            log_bytes("  prologue", fn);
+
+            void *detour = dx11 ? (void *)&EvalDetour11 : (void *)&EvalDetour12;
+            void **orig = dx11 ? (void **)&g_orig11 : (void **)&g_orig12;
+            const MH_STATUS st = MH_CreateHook(fn, detour, orig);
+            if (st != MH_OK) { LOG("  MH_CreateHook failed: %s", MH_StatusToString(st)); continue; }
+            (dx11 ? g_target11 : g_target12) = fn;
+            LOG("  trampoline=%p detour=%p", *orig, detour);
+            if (*orig == detour) { LOG("  trampoline == detour, aborting"); MH_RemoveHook(fn); continue; }
+            if (MH_EnableHook(fn) != MH_OK) { LOG("  MH_EnableHook failed"); continue; }
+            (dx11 ? g_hooked11 : g_hooked12) = true;
+            LOG("hooked %s in %ls", exportName, m);
+            break;
         }
-        if (!(g_hooked11 || g_hooked12)) Sleep(500);
+        if (!g_hooked11 && !g_hooked12) Sleep(500);
     }
-    if (!(g_hooked11 || g_hooked12)) {
-        LOG("NGX evaluate export not found in any module. Loaded NGX-related modules:");
-        HMODULE mods2[1024]; DWORD need = 0;
-        if (EnumProcessModules(GetCurrentProcess(), mods2, sizeof(mods2), &need)) {
-            for (DWORD k = 0; k < need / sizeof(HMODULE); k++) {
-                char name[MAX_PATH] = {};
-                GetModuleFileNameA(mods2[k], name, MAX_PATH);
-                if (strstr(name, "ngx") || strstr(name, "dlss") || strstr(name, "Luma") || strstr(name, "luma"))
-                    LOG("  %s", name);
-            }
-        }
-    }
+    if (!g_hooked11 && !g_hooked12) LOG("NGX evaluate export not found/hooked.");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -437,6 +498,8 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
         }
     }
 }
+
+static void on_init_device(device *dev) { g_api = (int)dev->get_api(); }
 
 static void on_destroy_resource(device *dev, resource res)
 {
@@ -472,10 +535,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::get_config_value(nullptr, "CameraMotionBlur", "MaxBlur",  g_cfg.maxBlur);
         reshade::get_config_value(nullptr, "CameraMotionBlur", "Samples",  g_cfg.samples);
         reshade::get_config_value(nullptr, "CameraMotionBlur", "ReverseZ", g_cfg.reverseZ);
+        reshade::get_config_value(nullptr, "CameraMotionBlur", "HookOnly", g_cfg.hookOnly);
 
         reshade::register_event<reshade::addon_event::barrier>(on_barrier);
         reshade::register_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
         reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_rt);
+        reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::present>(on_present);
         reshade::register_event<reshade::addon_event::destroy_resource>(on_destroy_resource);
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
