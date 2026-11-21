@@ -1,44 +1,31 @@
-cmake_minimum_required(VERSION 3.24)
-project(ff7_camera_motion_blur LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(ff7blur LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# Static CRT so the add-on has no VC++ redist dependency (also used by MinHook below)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-include(FetchContent)
+# fxc comes with the Windows SDK. Outside a developer prompt, take the newest
+# SDK installed in the default place.
+file(GLOB SDK_BIN LIST_DIRECTORIES true "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64")
+list(SORT SDK_BIN)
+list(REVERSE SDK_BIN)
+find_program(FXC fxc REQUIRED HINTS "$ENV{WindowsSdkVerBinPath}x64" ${SDK_BIN})
 
-# ReShade: headers only (no CMakeLists in the repo, SOURCE_SUBDIR stops add_subdirectory)
-FetchContent_Declare(reshade
-    GIT_REPOSITORY https://github.com/crosire/reshade.git
-    GIT_TAG        v6.4.1            # bump if the tag does not exist / to match your ReShade
-    GIT_SHALLOW    TRUE
-    GIT_SUBMODULES ""
-    SOURCE_SUBDIR  _no_cmake)
+set(header ${CMAKE_CURRENT_BINARY_DIR}/shaders/inject.h)
+add_custom_command(
+    OUTPUT ${header}
+    COMMAND ${FXC} /nologo /T cs_5_0 /E main /O3 /Vn inject_cs /Fh ${header} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/inject.hlsl
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/inject.hlsl
+    COMMENT "Compiling inject.hlsl")
 
-# NVIDIA NGX headers only (we never link NGX, we read its parameter block)
-FetchContent_Declare(dlss
-    GIT_REPOSITORY https://github.com/NVIDIA/DLSS.git
-    GIT_TAG        main
-    GIT_SHALLOW    TRUE
-    GIT_SUBMODULES ""
-    SOURCE_SUBDIR  _no_cmake)
-
-FetchContent_Declare(minhook
-    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-    GIT_TAG        v1.3.4
-    GIT_SHALLOW    TRUE)
-
-FetchContent_MakeAvailable(reshade dlss minhook)
-
-add_library(ff7_camera_motion_blur SHARED src/addon.cpp)
-
-target_compile_definitions(ff7_camera_motion_blur PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_include_directories(ff7_camera_motion_blur PRIVATE
-    ${reshade_SOURCE_DIR}/include
-    ${dlss_SOURCE_DIR}/include)
-target_link_libraries(ff7_camera_motion_blur PRIVATE minhook d3dcompiler)
-
-set_target_properties(ff7_camera_motion_blur PROPERTIES
-    PREFIX ""
-    SUFFIX ".addon64")
+# The leading 00- makes ReShade load the add-on first.
+add_library(ff7blur SHARED src/ff7blur.cpp ${header})
+target_include_directories(ff7blur PRIVATE
+    deps/reshade/include
+    deps/imgui
+    ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+target_link_libraries(ff7blur PRIVATE d3d11 dxgi)
+target_compile_definitions(ff7blur PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+target_compile_options(ff7blur PRIVATE /W3 /utf-8)
+set_target_properties(ff7blur PROPERTIES OUTPUT_NAME "00-FF7Remake-CameraBlur" SUFFIX ".addon64")
