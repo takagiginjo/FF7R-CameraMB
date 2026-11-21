@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Fetch ReShade
+        run: git clone --depth 1 --branch v6.8.0 https://github.com/crosire/reshade.git deps/reshade
+
+      # ReShade passes its own ImGui functions to add-ons, so this commit has to
+      # match the one ReShade v6.8.0 pins.
+      - name: Fetch ImGui
+        run: |
+          git clone https://github.com/ocornut/imgui.git deps/imgui
+          git -C deps/imgui checkout 3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Check the output
+        run: Get-ChildItem build/Release
+
+      - name: Upload the add-ons
+        uses: actions/upload-artifact@v4
+        with:
+          name: motionblur
+          path: build/Release/*.addon64
+          if-no-files-found: error
