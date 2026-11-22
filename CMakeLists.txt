@@ -12,12 +12,12 @@ list(SORT SDK_BIN)
 list(REVERSE SDK_BIN)
 find_program(FXC fxc REQUIRED HINTS "$ENV{WindowsSdkVerBinPath}x64" ${SDK_BIN})
 
-set(header ${CMAKE_CURRENT_BINARY_DIR}/shaders/inject.h)
+set(header ${CMAKE_CURRENT_BINARY_DIR}/shaders/flatten.h)
 add_custom_command(
     OUTPUT ${header}
-    COMMAND ${FXC} /nologo /T cs_5_0 /E main /O3 /Vn inject_cs /Fh ${header} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/inject.hlsl
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/inject.hlsl
-    COMMENT "Compiling inject.hlsl")
+    COMMAND ${FXC} /nologo /T cs_5_0 /E main /O3 /Vn flatten_cs /Fh ${header} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/flatten.hlsl
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/flatten.hlsl
+    COMMENT "Compiling flatten.hlsl")
 
 # The leading 00- makes ReShade load the add-on first.
 add_library(ff7blur SHARED src/ff7blur.cpp ${header})
